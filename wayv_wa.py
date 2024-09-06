@@ -4,6 +4,8 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from flask_cors import CORS
+from openai import OpenAI
+from axe_selenium_python import Axe
 import re
 
 app = Flask(__name__)
@@ -15,6 +17,11 @@ options.add_argument("--headless")  # Headless 모드 사용
 options.add_argument("--no-sandbox")
 options.add_argument("--disable-dev-shm-usage")
 options.add_argument("--window-size=1920,1080")
+
+# OpenAI API 설정
+client = OpenAI(
+    api_key="****"  # 자신의 OpenAI API 키로 변경하세요
+)
 
 # Chromedriver의 경로를 서비스로 설정
 service = Service()  # Chromedriver 설치 경로
@@ -133,13 +140,18 @@ def contrast():
         results = []
 
         for element in elements:
+            text = element.text.strip()  # 텍스트 앞뒤 공백 제거
+            # 텍스트가 비어 있거나, 공백만 있는 경우 건너뛰기
+            if not text:
+                continue
+            
             fg_color = driver.execute_script(
                 "return window.getComputedStyle(arguments[0]).color;", element)
             bg_color = driver.execute_script(
                 "return window.getComputedStyle(arguments[0]).backgroundColor;", element)
             contrast_ratio = calculate_contrast_ratio(fg_color, bg_color)
             results.append({
-                "text": element.text,
+                "text": text,
                 "foreground_color": fg_color,
                 "background_color": bg_color,
                 "contrast_ratio": contrast_ratio,
@@ -257,16 +269,35 @@ def table_structure():
         tables = driver.find_elements(By.TAG_NAME, 'table')
         results = []
 
+        compliant_count = 0
+        total_tables = len(tables)
+
         for table in tables:
             headers = table.find_elements(By.TAG_NAME, 'th')
             rows = table.find_elements(By.TAG_NAME, 'tr')
+            compliant = bool(headers and rows)  # 헤더와 행이 있으면 준수한 것으로 간주
+
+            if compliant:
+                compliant_count += 1
+
             results.append({
                 "headers": len(headers),
                 "rows": len(rows),
-                "message": "표 구성 확인 완료" if headers and rows else "표 구성 오류"
+                "compliant": compliant,
+                "message": "표 구성 확인 완료" if compliant else "표 구성 오류"
             })
 
-        return jsonify(results)
+        # 접근성 준수 비율 계산
+        compliant_percentage = (compliant_count / total_tables) * 100 if total_tables > 0 else 0
+
+        # 결과에 퍼센트 추가
+        summary = {
+            "total_tables": total_tables,
+            "compliant_count": compliant_count,
+            "compliant_percentage": round(compliant_percentage, 2)  # 소수점 둘째 자리까지 반올림
+        }
+
+        return jsonify({"results": results, "summary": summary})
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -302,6 +333,128 @@ def label():
             })
 
         return jsonify(results)
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    finally:
+        if driver is not None:
+            driver.quit()
+
+# 대체 텍스트 제공 확인
+@app.route('/alt_text', methods=['GET'])
+def alt_text():
+    url = request.args.get('url', '')
+    if not url:
+        return jsonify({"error": "URL 파라미터가 필요합니다."}), 400
+
+    driver = None
+    try:
+        driver = webdriver.Chrome(service=service, options=options)
+        driver.get(url)
+        driver.implicitly_wait(3)
+
+        images = driver.find_elements(By.TAG_NAME, 'img')
+        results = []
+
+        for img in images:
+            alt_text = img.get_attribute('alt')
+            img_url = img.get_attribute('src')
+
+            if not alt_text:
+                results.append({"alt": None, "message": "대체 텍스트 없음", "compliant": False})
+            else:
+                # OpenAI API를 통해 alt 텍스트의 적절성 평가
+                response = client.chat.completions.create(
+                    model="gpt-4o-2024-08-06",
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": "Evaluate if the alt text is appropriate for the image. If the alt text is appropriate, return this JSON: {{\"profit\": \"적절\", \"answer\": \"적절\"}}. If the alt text is too vague or not detailed enough, return this JSON: {{\"profit\": \"부분 적절\", \"answer\": \"이미지에 맞는 대체 텍스트\"}}. If the alt text is incorrect, return this JSON: {{\"profit\": \"부적절\", \"answer\": \"이미지에 맞는 대체 텍스트\"}}."
+                        },
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": f"alt='{alt_text}'"},
+                                {"type": "image_url", "image_url": {"url": img_url, "detail": "low"}},
+                            ],
+                        },
+                    ],
+                    temperature=1,
+                    max_tokens=256,
+                    top_p=1,
+                    frequency_penalty=0,
+                    presence_penalty=0,
+                    response_format={"type": "json_object"}
+                )
+
+                # API 결과를 JSON 형식으로 파싱
+                evaluation = response.choices[0].message.content  # 응답의 내용을 가져옴
+                evaluation_json = eval(evaluation)  # 문자열을 JSON으로 변환
+
+                results.append({"alt": alt_text, "evaluation": evaluation_json, "compliant": evaluation_json["profit"] == "적절"})
+
+        # 준수율 퍼센트 계산
+        compliant_count = sum(1 for result in results if result["compliant"])
+        total_images = len(results)
+        compliant_percentage = (compliant_count / total_images) * 100 if total_images > 0 else 0
+
+        # 결과 반환
+        summary = {
+            "total_images": total_images,
+            "compliant_count": compliant_count,
+            "compliant_percentage": round(compliant_percentage, 2)
+        }
+
+        return jsonify({"results": results, "summary": summary})
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    finally:
+        if driver is not None:
+            driver.quit()
+
+# 링크 접근성 검사 엔드포인트
+@app.route('/link_accessibility', methods=['GET'])
+def link_accessibility():
+    url = request.args.get('url', '')
+    if not url:
+        return jsonify({"error": "URL 파라미터가 필요합니다."}), 400
+
+    driver = None
+    try:
+        # Chrome WebDriver 설정
+        driver = webdriver.Chrome(service=service, options=options)
+        driver.get(url)
+        driver.implicitly_wait(3)
+        
+        # axe-selenium-python 사용
+        axe = Axe(driver)
+        axe.inject()  # axe-core 스크립트를 페이지에 삽입
+        
+        # 검사 수행
+        results = axe.run()
+        violations = results['violations']
+
+        # 링크 관련 위반 사항 필터링
+        link_violations = [
+            {
+                "description": violation['description'],
+                "impact": violation['impact'],
+                "help": violation['help'],
+                "nodes": [{
+                    "target": node['target'],
+                    "failureSummary": node['failureSummary']
+                } for node in violation['nodes']]
+            }
+            for violation in violations if violation['id'] == 'link-name'
+        ]
+
+        # 결과 저장 (필요 시 사용)
+        # axe.write_results(results, 'axe_report.json')
+
+        return jsonify(link_violations)
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
